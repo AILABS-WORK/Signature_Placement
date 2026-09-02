@@ -2,8 +2,9 @@
 //
 // Paste the Execute() body into an "SDK Script" activity (C#). The activity must be
 // bound to the triggering invoice entry. Requires the Laserfiche SDK (Repository
-// Access) licensed on the Workflow Server, and the folder C:\LFStamp containing
-// sign_invoice.exe (NTFS read/execute + read/write for the Workflow service account).
+// Access) licensed on the Workflow Server. sign_invoice.exe lives at EXE_PATH
+// (D:\Software); temp files go under WORK_ROOT — the Workflow service account
+// needs read/execute on the exe and Modify on WORK_ROOT.
 //
 // PHASE 1: one signature image for every invoice, stored on the Workflow Server
 // at C:\LFStamp\signature.png. (Phase 2 — per-account signatures matched by name
@@ -31,16 +32,17 @@ namespace WorkflowActivity.Scripting.SDKScript
         protected override void Execute()
         {
             // ---- CONFIG ----------------------------------------------------
-            const string ROOT          = @"C:\LFStamp";
+            const string EXE_PATH  = @"D:\Software\sign_invoice.exe";
+            const string WORK_ROOT = @"D:\Software\LFStamp";   // temp in/out files
             // Phase 1: ONE signature image stored IN THE REPOSITORY, e.g. an
             // image document named "signature" in the invoices folder.
             const string SIG_LF_PATH   = @"\Invoices\signature";
             const string SIGNED_FOLDER = @"\Invoices\Signed";
             // ----------------------------------------------------------------
 
-            string workIn  = Path.Combine(ROOT, "in");
-            string workOut = Path.Combine(ROOT, "out");
-            string exePath = Path.Combine(ROOT, "sign_invoice.exe");
+            string workIn  = Path.Combine(WORK_ROOT, "in");
+            string workOut = Path.Combine(WORK_ROOT, "out");
+            string exePath = EXE_PATH;
             Directory.CreateDirectory(workIn);
             Directory.CreateDirectory(workOut);
 
@@ -60,7 +62,7 @@ namespace WorkflowActivity.Scripting.SDKScript
                 //    re-exported only when the repository copy is newer). Phase 2
                 //    swaps this for a per-account signatures folder + --signatures.
                 DocumentInfo sigDoc = Document.GetDocumentInfo(SIG_LF_PATH, session);
-                string sigLocal = Path.Combine(ROOT, "signature." +
+                string sigLocal = Path.Combine(WORK_ROOT, "signature." +
                     (string.IsNullOrEmpty(sigDoc.Extension) ? "png" : sigDoc.Extension));
                 if (!File.Exists(sigLocal) ||
                     File.GetLastWriteTimeUtc(sigLocal) < sigDoc.LastModifiedTime.ToUniversalTime())
