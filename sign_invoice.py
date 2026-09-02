@@ -1,0 +1,286 @@
+r"""
+sign_invoice.py — stamp a signature image next to the banking details of a PDF invoice.
+
+The banking block can be anywhere on any page: the script finds it by searching for a
+heading (e.g. "Banking Details") or label lines (e.g. "IBAN ..."), measures the full
+block including the value column, then scans the area to the RIGHT of the block for
+genuinely empty white space (no text, no images, no vector drawings) and stamps there.
+
+Signature selection (first that applies):
+  1. --signature <image>            explicit file
+  2. --signatures <folder>          images named after the account name, e.g.
+                                    "Corient Advisory SA.png" — matched against the
+                                    document text (case/punctuation-insensitive)
+  3. signatures.json                {"account name": "image.png"} next to the input
+
+Usage:
+  python sign_invoice.py invoice.pdf --signatures \\server\sigs --out-file signed.pdf
+  python sign_invoice.py in_folder --signatures sigs_folder --out out_folder
+
+Machine output: the last stdout line is "RESULT {json}" with status/pages/signature.
+Exit codes: 0 = stamped, 2 = no banking details found, 3 = no empty space,
+            4 = no matching signature, 1 = bad arguments / IO error.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+import fitz  # PyMuPDF
+
+# Headings that mark the banking-details block. Only accepted when the line is
+# essentially just this text (so a sentence merely mentioning "banking details"
+# in running text is ignored). First term found wins.
+ANCHOR_TERMS = [
+    "banking details", "bank details", "bank account details",
+    "payment details", "remittance details",
+]
+# Fallback label-style anchors: accepted when a line STARTS with the term.
+LABEL_TERMS = ["iban", "account number"]
+# Max gap between the label column and the value column of the block (pt).
+COLUMN_GAP_MAX = 160
+# How far below the anchor line we still consider text part of the banking block (pt).
+BLOCK_REACH_DOWN = 110
+# Desired stamp size (pt). 1pt = 1/72". 170x60 ≈ 60x21 mm.
+SIG_WIDTH, SIG_HEIGHT = 170, 60
+# Clearance required around the stamp (pt).
+PAD = 8
+# Step used when sliding the candidate window (pt).
+STEP = 10
+
+SIG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+# exit codes
+OK, ERR_ARGS, NO_ANCHOR, NO_SPACE, NO_SIGNATURE = 0, 1, 2, 3, 4
+
+
+def page_lines(page: fitz.Page):
+    """All text lines on the page as (rect, text)."""
+    out = []
+    for tb in page.get_text("dict")["blocks"]:
+        for line in tb.get("lines", []):
+            text = "".join(s["text"] for s in line["spans"]).strip()
+            if text:
+                out.append((fitz.Rect(line["bbox"]), text))
+    return out
+
+
+def find_anchor(page: fitz.Page):
+    """Rect of the banking heading. Heading-style only: the line must essentially BE
+    the anchor term, so in-sentence mentions ('...to our banking details and...')
+    never match. Falls back to label-style lines ('IBAN: ...')."""
+    lines = page_lines(page)
+    for term in ANCHOR_TERMS:
+        for lr, text in lines:
+            t = text.lower().rstrip(":").strip()
+            if t == term or (t.startswith(term) and len(t) <= len(term) + 3):
+                return lr
+    for term in LABEL_TERMS:
+        for lr, text in lines:
+            if text.lower().startswith(term):
+                return lr
+    return None
+
+
+def banking_block_rect(page: fitz.Page, anchor: fitz.Rect) -> fitz.Rect:
+    """Union of the anchor, the label lines under it, and the adjacent value column
+    (two-column layouts: Bank / Address / Account Name on the left, values right)."""
+    lines = page_lines(page)
+    block = fitz.Rect(anchor)
+    # label column: lines starting near the anchor's left edge, within reach below it
+    for lr, _ in lines:
+        if abs(lr.x0 - anchor.x0) < 30 and anchor.y0 <= lr.y0 <= anchor.y1 + BLOCK_REACH_DOWN:
+            block |= lr
+    # value column(s): lines inside the block's vertical band starting just right of it
+    grew = True
+    while grew:
+        grew = False
+        for lr, _ in lines:
+            inside_band = lr.y0 >= block.y0 - 3 and lr.y1 <= block.y1 + 3
+            adjacent = block.x1 - 5 <= lr.x0 <= block.x1 + COLUMN_GAP_MAX
+            if inside_band and adjacent and lr.x1 > block.x1:
+                block |= lr
+                grew = True
+    return block
+
+
+def occupied_rects(page: fitz.Page):
+    """Everything already printed on the page: words, images, vector drawings."""
+    rects = [fitz.Rect(w[:4]) for w in page.get_text("words")]
+    rects += [fitz.Rect(i["bbox"]) for i in page.get_image_info()]
+    rects += [d["rect"] for d in page.get_drawings()]
+    return rects
+
+
+def find_empty_spot(page: fitz.Page, block: fitz.Rect):
+    """Slide a SIG_WIDTH x SIG_HEIGHT window through the area right of the banking
+    block and return the first placement that touches nothing, closest to the block
+    first. STRICT ROW RULE: the signature stays inside the block's horizontal band
+    (between imaginary lines at the block's top and bottom edges) — never above or
+    below it. If the block is shorter than the signature, the signature is centred
+    on the block's row instead."""
+    occupied = occupied_rects(page)
+    x_start = block.x1 + PAD
+    x_end = page.rect.width - SIG_WIDTH - PAD
+    if x_start > x_end:
+        return None
+
+    y_mid = block.y0 + (block.height - SIG_HEIGHT) / 2
+    if block.height >= SIG_HEIGHT:
+        # fully inside the band; try centred first, then other in-band offsets
+        y_lo, y_hi = block.y0, block.y1 - SIG_HEIGHT
+        ys = sorted(
+            {y_mid, y_hi} | {y_lo + i * STEP for i in range(int((y_hi - y_lo) / STEP) + 1)},
+            key=lambda y: abs(y - y_mid),
+        )
+    else:
+        # block shorter than the signature: the only allowed position is centred
+        # on the block's row (clamped to the page)
+        ys = [min(max(y_mid, PAD), page.rect.height - SIG_HEIGHT - PAD)]
+
+    x = x_start
+    while x <= x_end:
+        for y in ys:
+            cand = fitz.Rect(x, y, x + SIG_WIDTH, y + SIG_HEIGHT)
+            padded = cand + (-PAD, -PAD, PAD, PAD)
+            if not any(padded.intersects(r) for r in occupied):
+                return cand
+        x += STEP
+    return None
+
+
+def normalize(s: str) -> str:
+    """Lowercase, collapse punctuation/whitespace to single spaces."""
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def pick_signature_from_folder(page_text: str, sig_dir: Path):
+    """Match signature image filenames (named after the account name) against the
+    document text. Longest matching name wins so 'Corient Advisory SA' beats
+    'Corient' if both files exist."""
+    text = " " + normalize(page_text) + " "
+    best, best_len = None, 0
+    for f in sorted(sig_dir.iterdir()):
+        if f.suffix.lower() not in SIG_EXTENSIONS:
+            continue
+        phrase = normalize(f.stem)
+        if phrase and f" {phrase} " in text and len(phrase) > best_len:
+            best, best_len = f, len(phrase)
+    return best
+
+
+def pick_signature_from_map(page_text: str, mapping: dict, base: Path):
+    lowered = page_text.lower()
+    for name, sig_path in mapping.items():
+        if name.lower() in lowered:
+            return (base / sig_path).resolve()
+    return None
+
+
+def sign_pdf(pdf_path: Path, out_path: Path, sig_dir: Path | None,
+             mapping: dict, forced_sig: Path | None):
+    """Returns (exit_code, result_dict)."""
+    doc = fitz.open(pdf_path)
+    # account-name matching uses the WHOLE document's text: the account holder may
+    # be named on page 1 while the banking block sits on a later page
+    doc_text = "".join(p.get_text() for p in doc)
+    stamped, worst = [], NO_ANCHOR
+    for page in doc:
+        anchor = find_anchor(page)
+        if not anchor:
+            continue
+        block = banking_block_rect(page, anchor)
+        spot = find_empty_spot(page, block)
+        if spot is None:
+            worst = max(worst, NO_SPACE)
+            print(f"  page {page.number + 1}: banking details found but no empty space to the right")
+            continue
+        if forced_sig:
+            sig = forced_sig
+        elif sig_dir:
+            sig = pick_signature_from_folder(doc_text, sig_dir)
+        else:
+            sig = pick_signature_from_map(doc_text, mapping, pdf_path.parent)
+        if sig is None or not sig.exists():
+            worst = max(worst, NO_SIGNATURE)
+            print(f"  page {page.number + 1}: no matching signature image")
+            continue
+        page.insert_image(spot, filename=str(sig), keep_proportion=True)
+        stamped.append({"page": page.number + 1, "signature": sig.name,
+                        "x": round(spot.x0), "y": round(spot.y0)})
+
+    if stamped:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(out_path)
+        for s in stamped:
+            print(f"  page {s['page']}: stamped '{s['signature']}' at x={s['x']}, y={s['y']}"
+                  f" -> {out_path.name}")
+        code, status = OK, "stamped"
+    else:
+        code = worst
+        status = {NO_ANCHOR: "no_banking_details", NO_SPACE: "no_empty_space",
+                  NO_SIGNATURE: "no_matching_signature"}[worst]
+        print(f"  nothing stamped ({status})")
+    doc.close()
+    return code, {"status": status, "input": str(pdf_path),
+                  "output": str(out_path) if stamped else None, "stamps": stamped}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Stamp signature next to banking details in PDF invoices")
+    ap.add_argument("input", help="PDF file or folder of PDFs")
+    ap.add_argument("--signatures", help="folder of signature images named after account names")
+    ap.add_argument("--signature", help="explicit signature image (overrides matching)")
+    ap.add_argument("--map", default="signatures.json", help="account-name -> image mapping file")
+    ap.add_argument("--out", help="output folder")
+    ap.add_argument("--out-file", help="exact output file path (single-invoice mode)")
+    args = ap.parse_args()
+
+    src = Path(args.input)
+    if not src.exists():
+        print(f"input not found: {src}")
+        sys.exit(ERR_ARGS)
+    files = sorted(src.glob("*.pdf")) if src.is_dir() else [src]
+    files = [f for f in files if not f.stem.endswith("_signed")]
+    if not files:
+        print("no PDFs found")
+        sys.exit(ERR_ARGS)
+
+    sig_dir = Path(args.signatures) if args.signatures else None
+    if sig_dir and not sig_dir.is_dir():
+        print(f"signatures folder not found: {sig_dir}")
+        sys.exit(ERR_ARGS)
+    forced = Path(args.signature).resolve() if args.signature else None
+
+    mapping = {}
+    if not sig_dir and not forced:
+        map_path = Path(args.map) if Path(args.map).is_absolute() else \
+            (src if src.is_dir() else src.parent) / args.map
+        if not map_path.exists():
+            print("no --signatures/--signature given and no signatures.json found")
+            sys.exit(ERR_ARGS)
+        mapping = json.loads(map_path.read_text(encoding="utf-8"))
+
+    out_dir = Path(args.out) if args.out else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    worst, results = OK, []
+    for f in files:
+        print(f"{f.name}:")
+        if args.out_file and len(files) == 1:
+            out = Path(args.out_file)
+        else:
+            out = (out_dir or f.parent) / f"{f.stem}_signed.pdf"
+        code, result = sign_pdf(f, out, sig_dir, mapping, forced)
+        worst = max(worst, code)
+        results.append(result)
+
+    print("RESULT " + json.dumps(results[0] if len(results) == 1 else results))
+    sys.exit(worst)
+
+
+if __name__ == "__main__":
+    main()

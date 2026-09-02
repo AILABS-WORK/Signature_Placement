@@ -1,0 +1,15 @@
+# regenerable test artifacts
+corpus/
+corpus_signed/
+test/
+run.log
+*.png
+!miguel_villax_sig.png
+!signatures/*.png
+dist/*.pdf
+LFStamp_deploy.zip
+
+# build junk
+build/
+*.spec
+__pycache__/
