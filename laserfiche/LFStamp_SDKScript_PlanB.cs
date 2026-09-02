@@ -1,6 +1,13 @@
-// PLAN B: pure Laserfiche.RepositoryAccess version — no Laserfiche.DocumentServices
-// reference needed (avoids assembly version-mismatch warnings). Export/import is
-// done with RA edoc streams instead of DocumentExporter/DocumentImporter.
+// PLAN B (PRODUCTION): pure Laserfiche.RepositoryAccess version — no
+// Laserfiche.DocumentServices reference needed (avoids assembly version-mismatch
+// warnings). Export/import via RA edoc streams.
+//
+// Workflow mapping (stonehage-uat):
+//   Starting rule: entry created in \Staff Folder\msilva\Invoices\Incoming, ext pdf
+//   Conditional Decision on StampStatus:
+//     stamped -> Move Entry to \Staff Folder\msilva\Invoices\Documents
+//     else    -> Move Entry to \Staff Folder\msilva\Invoices\Needs_Review + email
+//   Signature image: repo document \Staff Folder\msilva\Invoices\Signatures\signature
 //
 // Paste the whole file into the Workflow 11 SDK Script activity (C#), replacing
 // the template. Only the CONFIG block should need editing.
@@ -31,11 +38,12 @@ namespace WorkflowActivity.Scripting.SDKScript
         /// </summary>
         protected override void Execute()
         {
-            // ---- CONFIG ----------------------------------------------------
+            // ---- CONFIG: stonehage-uat repository, msilva staff folder -----
+            // Repository paths NEVER include the repository name — root is "\".
             const string EXE_PATH      = @"D:\Software\sign_invoice.exe";
-            const string WORK_ROOT     = @"D:\Software\LFStamp";   // temp in/out files
-            const string SIG_LF_PATH   = @"\Invoices\Signature\signature";  // signature image DOCUMENT in the repo
-            const string SIGNED_FOLDER = @"\Invoices\Signed";      // where signed copies are filed
+            const string WORK_ROOT     = @"D:\Software\LFStamp";  // temp files on disk
+            const string SIG_LF_PATH   = @"\Staff Folder\msilva\Invoices\Signatures\signature";
+            const string SIGNED_FOLDER = @"\Staff Folder\msilva\Invoices\Signed";
             // ----------------------------------------------------------------
 
             string workIn  = Path.Combine(WORK_ROOT, "in");
