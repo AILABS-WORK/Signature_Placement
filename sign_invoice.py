@@ -151,6 +151,45 @@ def find_empty_spot(page: fitz.Page, block: fitz.Rect):
     return None
 
 
+_SIG_PIXMAPS: dict = {}
+
+
+def load_signature_pixmap(sig_path: Path):
+    """Load the signature image tolerantly and return a fitz.Pixmap, or None.
+    Laserfiche often re-encodes imported images (e.g. to TIFF) regardless of the
+    file name, so try: raw image decode -> PDF page render -> Pillow conversion."""
+    if sig_path in _SIG_PIXMAPS:
+        return _SIG_PIXMAPS[sig_path]
+    pix = None
+    try:
+        data = sig_path.read_bytes()
+    except OSError:
+        data = b""
+    if data:
+        try:
+            pix = fitz.Pixmap(data)
+        except Exception:
+            pix = None
+        if pix is None and data[:5] == b"%PDF-":
+            try:
+                with fitz.open(stream=data, filetype="pdf") as sdoc:
+                    pix = sdoc[0].get_pixmap(dpi=300, alpha=True)
+            except Exception:
+                pix = None
+        if pix is None:
+            try:
+                import io
+
+                from PIL import Image
+                buf = io.BytesIO()
+                Image.open(io.BytesIO(data)).convert("RGBA").save(buf, format="PNG")
+                pix = fitz.Pixmap(buf.getvalue())
+            except Exception:
+                pix = None
+    _SIG_PIXMAPS[sig_path] = pix
+    return pix
+
+
 def normalize(s: str) -> str:
     """Lowercase, collapse punctuation/whitespace to single spaces."""
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
@@ -207,7 +246,12 @@ def sign_pdf(pdf_path: Path, out_path: Path, sig_dir: Path | None,
             worst = max(worst, NO_SIGNATURE)
             print(f"  page {page.number + 1}: no matching signature image")
             continue
-        page.insert_image(spot, filename=str(sig), keep_proportion=True)
+        pix = load_signature_pixmap(sig)
+        if pix is None:
+            worst = max(worst, NO_SIGNATURE)
+            print(f"  page {page.number + 1}: signature image unreadable/empty: {sig.name}")
+            continue
+        page.insert_image(spot, pixmap=pix, keep_proportion=True)
         stamped.append({"page": page.number + 1, "signature": sig.name,
                         "x": round(spot.x0), "y": round(spot.y0)})
 
@@ -274,7 +318,13 @@ def main():
             out = Path(args.out_file)
         else:
             out = (out_dir or f.parent) / f"{f.stem}_signed.pdf"
-        code, result = sign_pdf(f, out, sig_dir, mapping, forced)
+        try:
+            code, result = sign_pdf(f, out, sig_dir, mapping, forced)
+        except Exception as e:
+            print(f"  error: {type(e).__name__}: {e}")
+            code = ERR_ARGS
+            result = {"status": "error", "input": str(f), "output": None,
+                      "stamps": [], "error": f"{type(e).__name__}: {e}"}
         worst = max(worst, code)
         results.append(result)
 
