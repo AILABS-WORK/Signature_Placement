@@ -34,7 +34,7 @@ namespace WorkflowActivity.Scripting.SDKScript
             // ---- CONFIG ----------------------------------------------------
             const string EXE_PATH      = @"D:\Software\sign_invoice.exe";
             const string WORK_ROOT     = @"D:\Software\LFStamp";   // temp in/out files
-            const string SIG_LF_PATH   = @"\Invoices\signature";   // signature image in the repository
+            const string SIG_LF_PATH   = @"\Invoices\Signature\signature";  // signature image DOCUMENT in the repo
             const string SIGNED_FOLDER = @"\Invoices\Signed";      // where signed copies are filed
             // ----------------------------------------------------------------
 
