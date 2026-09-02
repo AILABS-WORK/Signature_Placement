@@ -26,6 +26,10 @@ namespace WorkflowActivity.Scripting.SDKScript
     using System.Diagnostics;
     using System.IO;
     using Laserfiche.RepositoryAccess;
+    // DocumentExporter/DocumentImporter live in a SEPARATE assembly: add a
+    // reference to Laserfiche.DocumentServices (GAC, or the DLL under the
+    // Workflow / SDK install folder) in the script editor's References.
+    using Laserfiche.DocumentServices;
 
     public class Script1 : RAScriptClass104   // base class name comes from the WF template
     {
