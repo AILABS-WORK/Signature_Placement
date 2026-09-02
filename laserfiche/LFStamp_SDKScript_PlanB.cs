@@ -5,8 +5,7 @@
 // Paste the whole file into the Workflow 11 SDK Script activity (C#), replacing
 // the template. Only the CONFIG block should need editing.
 //
-// Version-sensitive calls (swap if your RA version's signature differs):
-//   doc.ReadEdoc()                       -> string mt; doc.ReadEdoc(out mt)
+// Version-sensitive calls (confirmed for this RA version: ReadEdoc(out mimeType)):
 //   newDoc.WriteEdoc(mime, length)       -> WriteEdoc(mime)  or  WriteEdoc(null, length)
 //   Document.GetDocumentInfo(path, s)    -> (DocumentInfo)Entry.GetEntryInfo(path, s)
 
@@ -55,7 +54,8 @@ namespace WorkflowActivity.Scripting.SDKScript
             try
             {
                 // 1) Export the triggering invoice's electronic document (stream copy)
-                using (Stream es = doc.ReadEdoc())
+                string docMime;
+                using (Stream es = doc.ReadEdoc(out docMime))
                 using (FileStream fs = new FileStream(inPdf, FileMode.Create, FileAccess.Write))
                 {
                     es.CopyTo(fs);
@@ -69,7 +69,8 @@ namespace WorkflowActivity.Scripting.SDKScript
                 if (!File.Exists(sigLocal) ||
                     File.GetLastWriteTimeUtc(sigLocal) < sigDoc.LastModifiedTime.ToUniversalTime())
                 {
-                    using (Stream ss = sigDoc.ReadEdoc())
+                    string sigMime;
+                    using (Stream ss = sigDoc.ReadEdoc(out sigMime))
                     using (FileStream fs = new FileStream(sigLocal, FileMode.Create, FileAccess.Write))
                     {
                         ss.CopyTo(fs);
