@@ -41,7 +41,7 @@ namespace WorkflowActivity.Scripting.SDKScript
             // ---- CONFIG: stonehage-uat repository, msilva staff folder -----
             // Repository paths NEVER include the repository name — root is "\".
             const string EXE_PATH      = @"D:\Software\sign_invoice.exe";
-            const string WORK_ROOT     = @"D:\Software\LFStamp";  // temp files on disk
+            const string WORK_ROOT     = @"D:\msilva\Projects\Signature_Placement\Work";  // temp files on disk
             const string SIG_LF_PATH   = @"\Staff Folder\msilva\Invoices\Signatures\signature";
             const string SIGNED_FOLDER = @"\Staff Folder\msilva\Invoices\Signed";
             // ----------------------------------------------------------------
