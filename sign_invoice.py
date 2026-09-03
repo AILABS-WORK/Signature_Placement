@@ -30,7 +30,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
-VERSION = "1.6.0"  # vertical centring on the banking block is the primary rule
+VERSION = "1.7.0"  # ignore invisible fills; report hspace; --explain
 
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
@@ -108,11 +108,30 @@ def banking_block_rect(page: fitz.Page, anchor: fitz.Rect) -> fitz.Rect:
     return block
 
 
+def _is_invisible(color) -> bool:
+    """True for no colour at all or (near-)white — nothing the eye can see."""
+    return color is None or min(color) > 0.95
+
+
 def occupied_rects(page: fitz.Page):
-    """Everything already printed on the page: words, images, vector drawings."""
+    """Everything VISIBLY printed on the page: words, images, vector drawings.
+
+    Ignores drawings the reader cannot see, because they must not push the
+    signature around: white/uncoloured background fills (invoice templates are
+    full of them) and any single path covering most of the page."""
     rects = [fitz.Rect(w[:4]) for w in page.get_text("words")]
     rects += [fitz.Rect(i["bbox"]) for i in page.get_image_info()]
-    rects += [d["rect"] for d in page.get_drawings()]
+    page_area = page.rect.get_area() or 1.0
+    for d in page.get_drawings():
+        fill, stroke = d.get("fill"), d.get("color")
+        if _is_invisible(fill) and _is_invisible(stroke):
+            continue                                   # nothing visible drawn
+        if d.get("type") == "f" and _is_invisible(fill):
+            continue                                   # invisible background fill
+        r = d["rect"]
+        if r.get_area() > 0.6 * page_area:
+            continue                                   # page-sized backdrop
+        rects.append(r)
     return rects
 
 
@@ -162,7 +181,7 @@ def _place_at_size(page, block, occupied, page_right, w, h, min_clear):
                 return c
         return c
 
-    best = None  # (sort key, rect, vertical offset, clearance)
+    best = None  # (sort key, rect, vertical offset, clearance, span)
     y = y_min
     while y <= y_max + 0.01:
         # usable left-edge positions at this height, grouped into runs
@@ -183,11 +202,12 @@ def _place_at_size(page, block, occupied, page_right, w, h, min_clear):
             voff = abs(y - y_pref)
             key = (round(voff / VBUCKET), -len(run))
             if best is None or key < best[0]:
-                best = (key, fitz.Rect(x_at, y, x_at + w, y + h), voff, c_at)
+                span = (run[0][0], run[-1][0] + w)
+                best = (key, fitz.Rect(x_at, y, x_at + w, y + h), voff, c_at, span)
         y += GRID
     if best is None:
         return None
-    return best[1], best[2], best[3]
+    return best[1], best[2], best[3], best[4]
 
 
 def find_empty_spot(page: fitz.Page, block: fitz.Rect):
@@ -207,16 +227,32 @@ def find_empty_spot(page: fitz.Page, block: fitz.Rect):
             got = _place_at_size(page, block, occupied, page_right,
                                  SIG_WIDTH * scale, SIG_HEIGHT * scale, min_clear)
             if got is not None:
-                rect, voff, clear = got
+                rect, voff, clear, span = got
                 options.append((voff + SCALE_PENALTY * (1 - scale), scale,
-                                rect, voff, clear))
+                                rect, voff, clear, span))
         if options:
-            _, scale, rect, voff, clear = min(options, key=lambda o: o[0])
+            _, scale, rect, voff, clear, span = min(options, key=lambda o: o[0])
             print(f"  placement: {label}, v-offset={voff:.0f}pt, "
                   f"clearance={clear:.0f}pt, scale={scale:g}, "
-                  f"band y=[{block.y0:.0f},{block.y1:.0f}]")
+                  f"band y=[{block.y0:.0f},{block.y1:.0f}], "
+                  f"block x1={block.x1:.0f}, hspace=[{span[0]:.0f},{span[1]:.0f}], "
+                  f"page w={page.rect.width:.0f}, at x={rect.x0:.0f}")
             return rect
     return None
+
+
+def explain_page(page: fitz.Page, block: fitz.Rect):
+    """Dump what the placement search sees on this page (--explain)."""
+    print(f"  EXPLAIN page {page.number + 1}: page={page.rect.width:.0f}x"
+          f"{page.rect.height:.0f}, block=[{block.x0:.0f},{block.y0:.0f},"
+          f"{block.x1:.0f},{block.y1:.0f}]")
+    words = {tuple(round(v) for v in w[:4]): w[4] for w in page.get_text("words")}
+    for r in occupied_rects(page):
+        if r.y1 > block.y0 - 2 and r.y0 < block.y1 + 2 and r.x1 > block.x1:
+            label = words.get(tuple(round(v) for v in (r.x0, r.y0, r.x1, r.y1)), "")
+            kind = "word" if label else "image/drawing"
+            print(f"    right-of-block {kind}: [{r.x0:.0f},{r.y0:.0f},"
+                  f"{r.x1:.0f},{r.y1:.0f}] {label}")
 
 
 _SIG_PIXMAPS: dict = {}
@@ -287,7 +323,7 @@ def pick_signature_from_map(page_text: str, mapping: dict, base: Path):
 
 
 def sign_pdf(pdf_path: Path, out_path: Path, sig_dir: Path | None,
-             mapping: dict, forced_sig: Path | None):
+             mapping: dict, forced_sig: Path | None, explain: bool = False):
     """Returns (exit_code, result_dict)."""
     doc = fitz.open(pdf_path)
     # account-name matching uses the WHOLE document's text: the account holder may
@@ -299,6 +335,8 @@ def sign_pdf(pdf_path: Path, out_path: Path, sig_dir: Path | None,
         if not anchor:
             continue
         block = banking_block_rect(page, anchor)
+        if explain:
+            explain_page(page, block)
         spot = find_empty_spot(page, block)
         if spot is None:
             worst = max(worst, NO_SPACE)
@@ -348,6 +386,8 @@ def main():
     ap.add_argument("--map", default="signatures.json", help="account-name -> image mapping file")
     ap.add_argument("--out", help="output folder")
     ap.add_argument("--out-file", help="exact output file path (single-invoice mode)")
+    ap.add_argument("--explain", action="store_true",
+                    help="dump the page geometry the placement search sees")
     args = ap.parse_args()
 
     src = Path(args.input)
@@ -388,7 +428,7 @@ def main():
         else:
             out = (out_dir or f.parent) / f"{f.stem}_signed.pdf"
         try:
-            code, result = sign_pdf(f, out, sig_dir, mapping, forced)
+            code, result = sign_pdf(f, out, sig_dir, mapping, forced, args.explain)
         except Exception as e:
             print(f"  error: {type(e).__name__}: {e}")
             code = ERR_ARGS
