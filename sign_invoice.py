@@ -30,6 +30,8 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+VERSION = "1.3.0"  # centered-gap placement
+
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
 # in running text is ignored). First term found wins.
@@ -162,6 +164,8 @@ def find_empty_spot(page: fitz.Page, block: fitz.Rect):
         cand = fitz.Rect(x, y, x + SIG_WIDTH, y + SIG_HEIGHT)
         padded = cand + (-PAD, -PAD, PAD, PAD)
         if not any(padded.intersects(r) for r in occupied):
+            print(f"  placement: centered in gap x=[{g0:.0f},{g1:.0f}], "
+                  f"band y=[{block.y0:.0f},{block.y1:.0f}]")
             return cand
 
     # fallback: closest-fit scan inside the band (previous behaviour)
@@ -181,6 +185,7 @@ def find_empty_spot(page: fitz.Page, block: fitz.Rect):
             cand = fitz.Rect(x, yy, x + SIG_WIDTH, yy + SIG_HEIGHT)
             padded = cand + (-PAD, -PAD, PAD, PAD)
             if not any(padded.intersects(r) for r in occupied):
+                print(f"  placement: fallback scan (no clean gap; gaps={[(round(a), round(b)) for a, b in gaps]})")
                 return cand
         x += STEP
     return None
@@ -346,6 +351,7 @@ def main():
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"sign_invoice v{VERSION}")
     worst, results = OK, []
     for f in files:
         print(f"{f.name}:")
