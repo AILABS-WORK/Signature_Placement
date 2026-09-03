@@ -30,7 +30,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
-VERSION = "1.4.0"  # max-clearance placement with adaptive downscaling
+VERSION = "1.5.0"  # center-of-white-space placement, smaller default stamp
 
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
@@ -45,8 +45,8 @@ LABEL_TERMS = ["iban", "account number"]
 COLUMN_GAP_MAX = 160
 # How far below the anchor line we still consider text part of the banking block (pt).
 BLOCK_REACH_DOWN = 110
-# Desired stamp size (pt). 1pt = 1/72". 170x60 ≈ 60x21 mm.
-SIG_WIDTH, SIG_HEIGHT = 170, 60
+# Desired stamp size (pt). 1pt = 1/72". 140x50 ≈ 49x18 mm.
+SIG_WIDTH, SIG_HEIGHT = 140, 50
 # Clearance required around the stamp (pt).
 PAD = 8
 # Step used when sliding the candidate window (pt).
@@ -120,68 +120,76 @@ def occupied_rects(page: fitz.Page):
 SIG_SCALES = [1.0, 0.85, 0.7]
 # Grid resolution for the placement search (pt).
 GRID = 6
+# A spot only counts as comfortable with at least this much space on all sides.
+GOOD_CLEARANCE = 16
 
 
 def find_empty_spot(page: fitz.Page, block: fitz.Rect):
     """Place the signature in the white space to the RIGHT of the banking block,
-    inside the block's horizontal band (never above or below it). Evaluates every
-    grid position and picks the one with the LARGEST minimum distance to any
-    surrounding print — i.e. maximum, most-equal white space around the signature
-    instead of hugging the block. If the full-size signature fits nowhere, retries
-    slightly smaller (85%, then 70%). Blocks shorter than the signature get it
-    centred on their row. Returns the placement rect or None."""
+    inside the block's horizontal band (never above or below it).
+
+    Pass 1 (comfort): for each scale, find all positions with at least
+    GOOD_CLEARANCE of white space on every side, and among them pick the one
+    closest to the CENTRE of the right-hand region (horizontally between the
+    block and the page edge, vertically mid-band) — most-equal space around it.
+    Pass 2 (cramped fallback): accept PAD clearance, maximise it.
+    Blocks shorter than the signature get it centred on their row."""
     occupied = occupied_rects(page)
     page_right = page.rect.width - PAD
     band_y0, band_y1 = block.y0, block.y1
+    tx = (block.x1 + page_right) / 2          # centre of the right-hand region
+    ty = (band_y0 + band_y1) / 2              # mid-band
 
-    for scale in SIG_SCALES:
-        w, h = SIG_WIDTH * scale, SIG_HEIGHT * scale
+    def search(w, h, min_clear, prefer_center):
         x_min, x_max = block.x1 + PAD, page_right - w
         if x_max < x_min:
-            continue
+            return None, 0.0
         if band_y1 - band_y0 >= h:
             y_min, y_max = band_y0, band_y1 - h
         else:
             yc = band_y0 + (band_y1 - band_y0 - h) / 2
             yc = min(max(yc, PAD), page.rect.height - h - PAD)
             y_min = y_max = yc
-        y_pref = band_y0 + (band_y1 - band_y0 - h) / 2  # band centre
-
-        # only print near the search region matters for clearance
         rel = [r for r in occupied
                if r.x1 > x_min - 80 and r.x0 < page_right + 80
                and r.y1 > y_min - 80 and r.y0 < y_max + h + 80]
-
-        def clearance(cand):
-            """Min gap to surrounding print / horizontal edges; -1 on contact."""
-            c = min(cand.x0 - block.x1, page_right - cand.x1)
-            for r in rel:
-                if cand.intersects(r):
-                    return -1.0
-                dx = max(r.x0 - cand.x1, cand.x0 - r.x1, 0.0)
-                dy = max(r.y0 - cand.y1, cand.y0 - r.y1, 0.0)
-                c = min(c, (dx * dx + dy * dy) ** 0.5)
-                if c < 0:
-                    return -1.0
-            return c
-
-        best, best_c = None, PAD - 0.001  # require at least PAD of clearance
+        best, best_key, best_c = None, None, 0.0
         y = y_min
         while y <= y_max + 0.01:
             x = x_min
             while x <= x_max + 0.01:
                 cand = fitz.Rect(x, y, x + w, y + h)
-                c = clearance(cand)
-                if c > best_c + 0.5 or (best is not None and abs(c - best_c) <= 0.5
-                                        and abs(y - y_pref) < abs(best.y0 - y_pref)):
-                    if c >= PAD:
-                        best, best_c = cand, c
+                c = min(cand.x0 - block.x1, page_right - cand.x1)
+                for r in rel:
+                    if cand.intersects(r):
+                        c = -1.0
+                        break
+                    dx = max(r.x0 - cand.x1, cand.x0 - r.x1, 0.0)
+                    dy = max(r.y0 - cand.y1, cand.y0 - r.y1, 0.0)
+                    c = min(c, (dx * dx + dy * dy) ** 0.5)
+                    if c < min_clear:
+                        break
+                if c >= min_clear:
+                    cx, cy = (cand.x0 + cand.x1) / 2, (cand.y0 + cand.y1) / 2
+                    key = ((cx - tx) ** 2 + (cy - ty) ** 2) if prefer_center else -c
+                    if best is None or key < best_key:
+                        best, best_key, best_c = cand, key, c
                 x += GRID
             y += GRID
-        if best is not None:
-            print(f"  placement: clearance={best_c:.0f}pt, scale={scale:g}, "
-                  f"band y=[{band_y0:.0f},{band_y1:.0f}]")
-            return best
+        return best, best_c
+
+    for scale in SIG_SCALES:
+        cand, c = search(SIG_WIDTH * scale, SIG_HEIGHT * scale, GOOD_CLEARANCE, True)
+        if cand is not None:
+            print(f"  placement: centered in white space, clearance={c:.0f}pt, "
+                  f"scale={scale:g}, band y=[{band_y0:.0f},{band_y1:.0f}]")
+            return cand
+    for scale in SIG_SCALES:
+        cand, c = search(SIG_WIDTH * scale, SIG_HEIGHT * scale, PAD, False)
+        if cand is not None:
+            print(f"  placement: cramped best-effort, clearance={c:.0f}pt, "
+                  f"scale={scale:g}, band y=[{band_y0:.0f},{band_y1:.0f}]")
+            return cand
     return None
 
 
