@@ -30,7 +30,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
-VERSION = "1.3.0"  # centered-gap placement
+VERSION = "1.4.0"  # max-clearance placement with adaptive downscaling
 
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
@@ -116,78 +116,72 @@ def occupied_rects(page: fitz.Page):
     return rects
 
 
+# If a full-size signature has no room, retry at these scales before giving up.
+SIG_SCALES = [1.0, 0.85, 0.7]
+# Grid resolution for the placement search (pt).
+GRID = 6
+
+
 def find_empty_spot(page: fitz.Page, block: fitz.Rect):
-    """Place the signature in the white space to the RIGHT of the banking block:
-    take the block's full top/bottom band, find the horizontal gaps between
-    everything printed inside that band and the page edge, pick the widest gap
-    that fits, and CENTRE the signature in it — both horizontally (equal space
-    left/right of the signature) and vertically (equal space above/below within
-    the band). STRICT ROW RULE: never above or below the block's band; a block
-    shorter than the signature gets it centred on its row. Falls back to a
-    closest-fit scan if the centred spot is somehow blocked."""
+    """Place the signature in the white space to the RIGHT of the banking block,
+    inside the block's horizontal band (never above or below it). Evaluates every
+    grid position and picks the one with the LARGEST minimum distance to any
+    surrounding print — i.e. maximum, most-equal white space around the signature
+    instead of hugging the block. If the full-size signature fits nowhere, retries
+    slightly smaller (85%, then 70%). Blocks shorter than the signature get it
+    centred on their row. Returns the placement rect or None."""
     occupied = occupied_rects(page)
     page_right = page.rect.width - PAD
-    if block.x1 + PAD + SIG_WIDTH > page_right:
-        return None
+    band_y0, band_y1 = block.y0, block.y1
 
-    # vertical: centred on the band (clamped to the page)
-    y = block.y0 + (block.height - SIG_HEIGHT) / 2
-    y = min(max(y, PAD), page.rect.height - SIG_HEIGHT - PAD)
-
-    # horizontal: merge the x-intervals of everything overlapping the band,
-    # then look at the gaps to the right of the block
-    ivals = sorted(
-        (r.x0, r.x1) for r in occupied
-        if r.y1 > block.y0 - 2 and r.y0 < block.y1 + 2
-    )
-    merged = []
-    for a, b in ivals:
-        if merged and a <= merged[-1][1] + 1:
-            merged[-1][1] = max(merged[-1][1], b)
+    for scale in SIG_SCALES:
+        w, h = SIG_WIDTH * scale, SIG_HEIGHT * scale
+        x_min, x_max = block.x1 + PAD, page_right - w
+        if x_max < x_min:
+            continue
+        if band_y1 - band_y0 >= h:
+            y_min, y_max = band_y0, band_y1 - h
         else:
-            merged.append([a, b])
-    gaps, prev = [], block.x1
-    for a, b in merged:
-        if b <= prev:
-            continue
-        if a > prev:
-            gaps.append((prev, min(a, page_right)))
-        prev = max(prev, b)
-    if prev < page_right:
-        gaps.append((prev, page_right))
+            yc = band_y0 + (band_y1 - band_y0 - h) / 2
+            yc = min(max(yc, PAD), page.rect.height - h - PAD)
+            y_min = y_max = yc
+        y_pref = band_y0 + (band_y1 - band_y0 - h) / 2  # band centre
 
-    need = SIG_WIDTH + 2 * PAD
-    for g0, g1 in sorted(gaps, key=lambda g: g[1] - g[0], reverse=True):
-        if g1 - g0 < need:
-            continue
-        x = g0 + ((g1 - g0) - SIG_WIDTH) / 2  # centred in the gap
-        cand = fitz.Rect(x, y, x + SIG_WIDTH, y + SIG_HEIGHT)
-        padded = cand + (-PAD, -PAD, PAD, PAD)
-        if not any(padded.intersects(r) for r in occupied):
-            print(f"  placement: centered in gap x=[{g0:.0f},{g1:.0f}], "
-                  f"band y=[{block.y0:.0f},{block.y1:.0f}]")
-            return cand
+        # only print near the search region matters for clearance
+        rel = [r for r in occupied
+               if r.x1 > x_min - 80 and r.x0 < page_right + 80
+               and r.y1 > y_min - 80 and r.y0 < y_max + h + 80]
 
-    # fallback: closest-fit scan inside the band (previous behaviour)
-    y_mid = block.y0 + (block.height - SIG_HEIGHT) / 2
-    if block.height >= SIG_HEIGHT:
-        y_lo, y_hi = block.y0, block.y1 - SIG_HEIGHT
-        ys = sorted(
-            {y_mid, y_hi} | {y_lo + i * STEP for i in range(int((y_hi - y_lo) / STEP) + 1)},
-            key=lambda yy: abs(yy - y_mid),
-        )
-    else:
-        ys = [min(max(y_mid, PAD), page.rect.height - SIG_HEIGHT - PAD)]
-    x = block.x1 + PAD
-    x_end = page.rect.width - SIG_WIDTH - PAD
-    while x <= x_end:
-        for yy in ys:
-            cand = fitz.Rect(x, yy, x + SIG_WIDTH, yy + SIG_HEIGHT)
-            padded = cand + (-PAD, -PAD, PAD, PAD)
-            if not any(padded.intersects(r) for r in occupied):
-                print(f"  placement: fallback scan (no clean gap; gaps={[(round(a), round(b)) for a, b in gaps]})")
-                return cand
-        x += STEP
+        def clearance(cand):
+            """Min gap to surrounding print / horizontal edges; -1 on contact."""
+            c = min(cand.x0 - block.x1, page_right - cand.x1)
+            for r in rel:
+                if cand.intersects(r):
+                    return -1.0
+                dx = max(r.x0 - cand.x1, cand.x0 - r.x1, 0.0)
+                dy = max(r.y0 - cand.y1, cand.y0 - r.y1, 0.0)
+                c = min(c, (dx * dx + dy * dy) ** 0.5)
+                if c < 0:
+                    return -1.0
+            return c
+
+        best, best_c = None, PAD - 0.001  # require at least PAD of clearance
+        y = y_min
+        while y <= y_max + 0.01:
+            x = x_min
+            while x <= x_max + 0.01:
+                cand = fitz.Rect(x, y, x + w, y + h)
+                c = clearance(cand)
+                if c > best_c + 0.5 or (best is not None and abs(c - best_c) <= 0.5
+                                        and abs(y - y_pref) < abs(best.y0 - y_pref)):
+                    if c >= PAD:
+                        best, best_c = cand, c
+                x += GRID
+            y += GRID
+        if best is not None:
+            print(f"  placement: clearance={best_c:.0f}pt, scale={scale:g}, "
+                  f"band y=[{band_y0:.0f},{band_y1:.0f}]")
+            return best
     return None
 
 
