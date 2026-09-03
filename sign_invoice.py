@@ -115,35 +115,70 @@ def occupied_rects(page: fitz.Page):
 
 
 def find_empty_spot(page: fitz.Page, block: fitz.Rect):
-    """Slide a SIG_WIDTH x SIG_HEIGHT window through the area right of the banking
-    block and return the first placement that touches nothing, closest to the block
-    first. STRICT ROW RULE: the signature stays inside the block's horizontal band
-    (between imaginary lines at the block's top and bottom edges) — never above or
-    below it. If the block is shorter than the signature, the signature is centred
-    on the block's row instead."""
+    """Place the signature in the white space to the RIGHT of the banking block:
+    take the block's full top/bottom band, find the horizontal gaps between
+    everything printed inside that band and the page edge, pick the widest gap
+    that fits, and CENTRE the signature in it — both horizontally (equal space
+    left/right of the signature) and vertically (equal space above/below within
+    the band). STRICT ROW RULE: never above or below the block's band; a block
+    shorter than the signature gets it centred on its row. Falls back to a
+    closest-fit scan if the centred spot is somehow blocked."""
     occupied = occupied_rects(page)
-    x_start = block.x1 + PAD
-    x_end = page.rect.width - SIG_WIDTH - PAD
-    if x_start > x_end:
+    page_right = page.rect.width - PAD
+    if block.x1 + PAD + SIG_WIDTH > page_right:
         return None
 
+    # vertical: centred on the band (clamped to the page)
+    y = block.y0 + (block.height - SIG_HEIGHT) / 2
+    y = min(max(y, PAD), page.rect.height - SIG_HEIGHT - PAD)
+
+    # horizontal: merge the x-intervals of everything overlapping the band,
+    # then look at the gaps to the right of the block
+    ivals = sorted(
+        (r.x0, r.x1) for r in occupied
+        if r.y1 > block.y0 - 2 and r.y0 < block.y1 + 2
+    )
+    merged = []
+    for a, b in ivals:
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    gaps, prev = [], block.x1
+    for a, b in merged:
+        if b <= prev:
+            continue
+        if a > prev:
+            gaps.append((prev, min(a, page_right)))
+        prev = max(prev, b)
+    if prev < page_right:
+        gaps.append((prev, page_right))
+
+    need = SIG_WIDTH + 2 * PAD
+    for g0, g1 in sorted(gaps, key=lambda g: g[1] - g[0], reverse=True):
+        if g1 - g0 < need:
+            continue
+        x = g0 + ((g1 - g0) - SIG_WIDTH) / 2  # centred in the gap
+        cand = fitz.Rect(x, y, x + SIG_WIDTH, y + SIG_HEIGHT)
+        padded = cand + (-PAD, -PAD, PAD, PAD)
+        if not any(padded.intersects(r) for r in occupied):
+            return cand
+
+    # fallback: closest-fit scan inside the band (previous behaviour)
     y_mid = block.y0 + (block.height - SIG_HEIGHT) / 2
     if block.height >= SIG_HEIGHT:
-        # fully inside the band; try centred first, then other in-band offsets
         y_lo, y_hi = block.y0, block.y1 - SIG_HEIGHT
         ys = sorted(
             {y_mid, y_hi} | {y_lo + i * STEP for i in range(int((y_hi - y_lo) / STEP) + 1)},
-            key=lambda y: abs(y - y_mid),
+            key=lambda yy: abs(yy - y_mid),
         )
     else:
-        # block shorter than the signature: the only allowed position is centred
-        # on the block's row (clamped to the page)
         ys = [min(max(y_mid, PAD), page.rect.height - SIG_HEIGHT - PAD)]
-
-    x = x_start
+    x = block.x1 + PAD
+    x_end = page.rect.width - SIG_WIDTH - PAD
     while x <= x_end:
-        for y in ys:
-            cand = fitz.Rect(x, y, x + SIG_WIDTH, y + SIG_HEIGHT)
+        for yy in ys:
+            cand = fitz.Rect(x, yy, x + SIG_WIDTH, yy + SIG_HEIGHT)
             padded = cand + (-PAD, -PAD, PAD, PAD)
             if not any(padded.intersects(r) for r in occupied):
                 return cand
