@@ -30,7 +30,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
-VERSION = "1.5.0"  # center-of-white-space placement, smaller default stamp
+VERSION = "1.6.0"  # vertical centring on the banking block is the primary rule
 
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
@@ -122,74 +122,100 @@ SIG_SCALES = [1.0, 0.85, 0.7]
 GRID = 6
 # A spot only counts as comfortable with at least this much space on all sides.
 GOOD_CLEARANCE = 16
+# Vertical offsets within this many pt of each other count as equally centred.
+VBUCKET = 8
+# Cost, in pt of virtual vertical offset, charged for shrinking the signature.
+# Higher = keep the signature big; lower = shrink more readily to stay centred.
+SCALE_PENALTY = 40
+
+
+def _place_at_size(page, block, occupied, page_right, w, h, min_clear):
+    """Best placement of a w x h signature to the right of the block.
+    Vertical centring on the block's band is the PRIMARY goal; at the chosen
+    height the signature is centred within the run of usable white space.
+    Returns (rect, vertical_offset, clearance) or None."""
+    band_y0, band_y1 = block.y0, block.y1
+    x_min, x_max = block.x1 + PAD, page_right - w
+    if x_max < x_min:
+        return None
+    if band_y1 - band_y0 >= h:
+        y_min, y_max = band_y0, band_y1 - h
+    else:  # block shorter than the signature: only its own row is allowed
+        yc = min(max(band_y0 + (band_y1 - band_y0 - h) / 2, PAD),
+                 page.rect.height - h - PAD)
+        y_min = y_max = yc
+    y_pref = band_y0 + (band_y1 - band_y0 - h) / 2  # perfectly centred on the band
+
+    rel = [r for r in occupied
+           if r.x1 > x_min - 80 and r.x0 < page_right + 80
+           and r.y1 > y_min - 80 and r.y0 < y_max + h + 80]
+
+    def clearance(cand):
+        c = min(cand.x0 - block.x1, page_right - cand.x1)
+        for r in rel:
+            if cand.intersects(r):
+                return -1.0
+            dx = max(r.x0 - cand.x1, cand.x0 - r.x1, 0.0)
+            dy = max(r.y0 - cand.y1, cand.y0 - r.y1, 0.0)
+            c = min(c, (dx * dx + dy * dy) ** 0.5)
+            if c < min_clear:
+                return c
+        return c
+
+    best = None  # (sort key, rect, vertical offset, clearance)
+    y = y_min
+    while y <= y_max + 0.01:
+        # usable left-edge positions at this height, grouped into runs
+        runs, cur, x = [], [], x_min
+        while x <= x_max + 0.01:
+            c = clearance(fitz.Rect(x, y, x + w, y + h))
+            if c >= min_clear:
+                cur.append((x, c))
+            elif cur:
+                runs.append(cur)
+                cur = []
+            x += GRID
+        if cur:
+            runs.append(cur)
+        if runs:
+            run = max(runs, key=len)          # widest white space at this height
+            x_at, c_at = run[len(run) // 2]   # centred within it
+            voff = abs(y - y_pref)
+            key = (round(voff / VBUCKET), -len(run))
+            if best is None or key < best[0]:
+                best = (key, fitz.Rect(x_at, y, x_at + w, y + h), voff, c_at)
+        y += GRID
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
 
 
 def find_empty_spot(page: fitz.Page, block: fitz.Rect):
-    """Place the signature in the white space to the RIGHT of the banking block,
-    inside the block's horizontal band (never above or below it).
+    """Place the signature in the white space to the RIGHT of the banking block.
 
-    Pass 1 (comfort): for each scale, find all positions with at least
-    GOOD_CLEARANCE of white space on every side, and among them pick the one
-    closest to the CENTRE of the right-hand region (horizontally between the
-    block and the page edge, vertically mid-band) — most-equal space around it.
-    Pass 2 (cramped fallback): accept PAD clearance, maximise it.
-    Blocks shorter than the signature get it centred on their row."""
+    Vertically it is centred on the block's band (never above or below it);
+    horizontally it is centred in the white space available at that height.
+    Sizes are tried largest-first and a smaller signature wins only when it buys
+    materially better vertical centring (see SCALE_PENALTY). A first pass demands
+    comfortable clearance on all sides; a second accepts tighter spots."""
     occupied = occupied_rects(page)
     page_right = page.rect.width - PAD
-    band_y0, band_y1 = block.y0, block.y1
-    tx = (block.x1 + page_right) / 2          # centre of the right-hand region
-    ty = (band_y0 + band_y1) / 2              # mid-band
 
-    def search(w, h, min_clear, prefer_center):
-        x_min, x_max = block.x1 + PAD, page_right - w
-        if x_max < x_min:
-            return None, 0.0
-        if band_y1 - band_y0 >= h:
-            y_min, y_max = band_y0, band_y1 - h
-        else:
-            yc = band_y0 + (band_y1 - band_y0 - h) / 2
-            yc = min(max(yc, PAD), page.rect.height - h - PAD)
-            y_min = y_max = yc
-        rel = [r for r in occupied
-               if r.x1 > x_min - 80 and r.x0 < page_right + 80
-               and r.y1 > y_min - 80 and r.y0 < y_max + h + 80]
-        best, best_key, best_c = None, None, 0.0
-        y = y_min
-        while y <= y_max + 0.01:
-            x = x_min
-            while x <= x_max + 0.01:
-                cand = fitz.Rect(x, y, x + w, y + h)
-                c = min(cand.x0 - block.x1, page_right - cand.x1)
-                for r in rel:
-                    if cand.intersects(r):
-                        c = -1.0
-                        break
-                    dx = max(r.x0 - cand.x1, cand.x0 - r.x1, 0.0)
-                    dy = max(r.y0 - cand.y1, cand.y0 - r.y1, 0.0)
-                    c = min(c, (dx * dx + dy * dy) ** 0.5)
-                    if c < min_clear:
-                        break
-                if c >= min_clear:
-                    cx, cy = (cand.x0 + cand.x1) / 2, (cand.y0 + cand.y1) / 2
-                    key = ((cx - tx) ** 2 + (cy - ty) ** 2) if prefer_center else -c
-                    if best is None or key < best_key:
-                        best, best_key, best_c = cand, key, c
-                x += GRID
-            y += GRID
-        return best, best_c
-
-    for scale in SIG_SCALES:
-        cand, c = search(SIG_WIDTH * scale, SIG_HEIGHT * scale, GOOD_CLEARANCE, True)
-        if cand is not None:
-            print(f"  placement: centered in white space, clearance={c:.0f}pt, "
-                  f"scale={scale:g}, band y=[{band_y0:.0f},{band_y1:.0f}]")
-            return cand
-    for scale in SIG_SCALES:
-        cand, c = search(SIG_WIDTH * scale, SIG_HEIGHT * scale, PAD, False)
-        if cand is not None:
-            print(f"  placement: cramped best-effort, clearance={c:.0f}pt, "
-                  f"scale={scale:g}, band y=[{band_y0:.0f},{band_y1:.0f}]")
-            return cand
+    for min_clear, label in ((GOOD_CLEARANCE, "centered"), (PAD, "centered (tight)")):
+        options = []
+        for scale in SIG_SCALES:
+            got = _place_at_size(page, block, occupied, page_right,
+                                 SIG_WIDTH * scale, SIG_HEIGHT * scale, min_clear)
+            if got is not None:
+                rect, voff, clear = got
+                options.append((voff + SCALE_PENALTY * (1 - scale), scale,
+                                rect, voff, clear))
+        if options:
+            _, scale, rect, voff, clear = min(options, key=lambda o: o[0])
+            print(f"  placement: {label}, v-offset={voff:.0f}pt, "
+                  f"clearance={clear:.0f}pt, scale={scale:g}, "
+                  f"band y=[{block.y0:.0f},{block.y1:.0f}]")
+            return rect
     return None
 
 
