@@ -30,7 +30,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
-VERSION = "1.7.0"  # ignore invisible fills; report hspace; --explain
+VERSION = "1.8.0"  # ignore invisible text/images too; richer --explain
 
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
@@ -110,18 +110,46 @@ def banking_block_rect(page: fitz.Page, anchor: fitz.Rect) -> fitz.Rect:
 
 def _is_invisible(color) -> bool:
     """True for no colour at all or (near-)white — nothing the eye can see."""
-    return color is None or min(color) > 0.95
+    return color is None or min(color) > 0.9
+
+
+def _white_text_rects(page: fitz.Page):
+    """Bounding boxes of (near-)white text: invisible OCR layers and hidden
+    template text, which must not be treated as obstacles."""
+    out = []
+    for tb in page.get_text("dict")["blocks"]:
+        for line in tb.get("lines", []):
+            for span in line.get("spans", []):
+                c = span.get("color", 0)
+                rgb = (((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255)
+                if min(rgb) > 0.9:
+                    out.append(fitz.Rect(span["bbox"]))
+    return out
 
 
 def occupied_rects(page: fitz.Page):
     """Everything VISIBLY printed on the page: words, images, vector drawings.
 
-    Ignores drawings the reader cannot see, because they must not push the
-    signature around: white/uncoloured background fills (invoice templates are
-    full of them) and any single path covering most of the page."""
-    rects = [fitz.Rect(w[:4]) for w in page.get_text("words")]
-    rects += [fitz.Rect(i["bbox"]) for i in page.get_image_info()]
+    Objects the reader cannot see must not push the signature around, so this
+    skips white/uncoloured fills and strokes (invoice templates are full of
+    them), (near-)white text such as invisible OCR layers, and any single
+    drawing or image large enough to be a page backdrop."""
     page_area = page.rect.get_area() or 1.0
+    invisible_text = _white_text_rects(page)
+
+    rects = []
+    for w in page.get_text("words"):
+        r = fitz.Rect(w[:4])
+        if any(r in wr for wr in invisible_text):
+            continue
+        rects.append(r)
+
+    for i in page.get_image_info():
+        r = fitz.Rect(i["bbox"])
+        if r.get_area() > 0.6 * page_area:
+            continue                                   # page-sized backdrop
+        rects.append(r)
+
     for d in page.get_drawings():
         fill, stroke = d.get("fill"), d.get("color")
         if _is_invisible(fill) and _is_invisible(stroke):
@@ -242,17 +270,37 @@ def find_empty_spot(page: fitz.Page, block: fitz.Rect):
 
 
 def explain_page(page: fitz.Page, block: fitz.Rect):
-    """Dump what the placement search sees on this page (--explain)."""
+    """Dump everything in the block's band right of it (--explain): the
+    obstacles the search honours, and the objects it deliberately ignores."""
     print(f"  EXPLAIN page {page.number + 1}: page={page.rect.width:.0f}x"
           f"{page.rect.height:.0f}, block=[{block.x0:.0f},{block.y0:.0f},"
           f"{block.x1:.0f},{block.y1:.0f}]")
+
+    def in_band(r):
+        return r.y1 > block.y0 - 2 and r.y0 < block.y1 + 2 and r.x1 > block.x1
+
     words = {tuple(round(v) for v in w[:4]): w[4] for w in page.get_text("words")}
     for r in occupied_rects(page):
-        if r.y1 > block.y0 - 2 and r.y0 < block.y1 + 2 and r.x1 > block.x1:
+        if in_band(r):
             label = words.get(tuple(round(v) for v in (r.x0, r.y0, r.x1, r.y1)), "")
-            kind = "word" if label else "image/drawing"
-            print(f"    right-of-block {kind}: [{r.x0:.0f},{r.y0:.0f},"
-                  f"{r.x1:.0f},{r.y1:.0f}] {label}")
+            print(f"    OBSTACLE {'word' if label else 'image/drawing'}: "
+                  f"[{r.x0:.0f},{r.y0:.0f},{r.x1:.0f},{r.y1:.0f}] {label}")
+
+    for w in page.get_text("words"):
+        r = fitz.Rect(w[:4])
+        if in_band(r) and any(r in wr for wr in _white_text_rects(page)):
+            print(f"    ignored white text: [{r.x0:.0f},{r.y0:.0f},"
+                  f"{r.x1:.0f},{r.y1:.0f}] {w[4]}")
+    for i in page.get_image_info():
+        r = fitz.Rect(i["bbox"])
+        if in_band(r) and r.get_area() > 0.6 * (page.rect.get_area() or 1.0):
+            print(f"    ignored big image: [{r.x0:.0f},{r.y0:.0f},{r.x1:.0f},{r.y1:.0f}]")
+    for d in page.get_drawings():
+        r = d["rect"]
+        if in_band(r):
+            print(f"    drawing type={d.get('type')} fill={d.get('fill')} "
+                  f"stroke={d.get('color')} rect=[{r.x0:.0f},{r.y0:.0f},"
+                  f"{r.x1:.0f},{r.y1:.0f}]")
 
 
 _SIG_PIXMAPS: dict = {}
