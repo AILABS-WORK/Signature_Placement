@@ -1,91 +1,105 @@
-// SDK Script activity body for Laserfiche Workflow (self-hosted, Workflow 10/11).
+// PRODUCTION SDK Script — Laserfiche Workflow 11 (stonehage-uat, DMLWF105U03).
+// This is the ONE script to deploy. Paste the whole file into the SDK Script
+// activity (C#), replacing the template. Only the CONFIG block needs editing.
 //
-// Paste the Execute() body into an "SDK Script" activity (C#). The activity must be
-// bound to the triggering invoice entry. Requires the Laserfiche SDK (Repository
-// Access) licensed on the Workflow Server. sign_invoice.exe lives at EXE_PATH
-// (D:\Software); temp files go under WORK_ROOT — the Workflow service account
-// needs read/execute on the exe and Modify on WORK_ROOT.
+// Invoices live in the repository; the signature image lives on the server's
+// disk. The signature is deliberately NOT exported from the repository: an
+// image imported into Laserfiche is usually stored as TIFF pages with an EMPTY
+// electronic document, so exporting it produced a 0 KB file and wiped whatever
+// was already there (FileMode.Create truncates first).
 //
-// PHASE 1: one signature image for every invoice, stored on the Workflow Server
-// at C:\LFStamp\signature.png. (Phase 2 — per-account signatures matched by name
-// from a repository folder — swaps the SIGNATURE_FILE argument for a mirrored
-// signatures folder and "--signatures"; see README.)
+// Flow per invoice:
+//   \...\Invoices\Incoming  --trigger--> export pdf to WORK_ROOT\in
+//                                        run sign_invoice.exe --signature SIG_FILE
+//                                        import signed pdf into SIGNED_FOLDER
+//                                        delete temp files
+// Tokens: StampStatus (stamped | no_banking_details | no_empty_space |
+//         no_matching_signature | error), StampDetail, SignedEntryId, DebugInfo.
 //
-// Repository layout assumed (adjust the paths marked CONFIG):
-//   \Invoices\Incoming     -> workflow starting rule watches this folder
-//   \Invoices\Signed       -> signed copies are filed here
-//
-// Tokens set for downstream routing:
-//   StampStatus : stamped | no_banking_details | no_empty_space |
-//                 no_matching_signature | error
-//   StampDetail : stdout of the stamper (includes the RESULT json line)
+// No extra assembly references: RepositoryAccess only (no DocumentServices, so
+// no version-mismatch warnings). ReadEdoc/WriteEdoc use this RA version's
+// overloads: ReadEdoc(out mimeType), WriteEdoc(mimeType, length).
 
 namespace WorkflowActivity.Scripting.SDKScript
 {
     using System;
+    using System.Collections.Generic;
+    using System.ComponentModel;
+    using System.Data;
+    using System.Data.SqlClient;
     using System.Diagnostics;
     using System.IO;
+    using System.Text;
     using Laserfiche.RepositoryAccess;
-    // DocumentExporter/DocumentImporter live in a SEPARATE assembly: add a
-    // reference to Laserfiche.DocumentServices (GAC, or the DLL under the
-    // Workflow / SDK install folder) in the script editor's References.
-    using Laserfiche.DocumentServices;
 
-    public class Script1 : RAScriptClass104   // base class name comes from the WF template
+    /// <summary>
+    /// Provides one or more methods that can be run when the workflow scripting activity is performed.
+    /// </summary>
+    public class Script1 : RAScriptClass110
     {
+        /// <summary>
+        /// This method is run when the activity is performed.
+        /// </summary>
         protected override void Execute()
         {
             // ---- CONFIG ----------------------------------------------------
-            const string EXE_PATH  = @"D:\Software\sign_invoice.exe";
-            const string WORK_ROOT = @"D:\Software\LFStamp";   // temp in/out files
-            // Phase 1: ONE signature image stored IN THE REPOSITORY, e.g. an
-            // image document named "signature" in the invoices folder.
-            const string SIG_LF_PATH   = @"\Invoices\signature";
-            const string SIGNED_FOLDER = @"\Invoices\Signed";
+            // Keep EXE_PATH as whatever this server actually uses.
+            const string EXE_PATH  = @"C:\Software\sign_invoice.exe";
+            const string WORK_ROOT = @"C:\Software\msilva\Projects\Signature_Placement\Work";
+            // The signature PNG on disk. Keep it OUTSIDE WORK_ROOT: Work holds
+            // throwaway files. Nothing in this script ever writes to it.
+            const string SIG_FILE  = @"C:\Software\msilva\Projects\Signature_Placement\signature.png";
+            // Repository folder that receives the signed copies.
+            const string SIGNED_FOLDER = @"\Staff Folder\msilva\Invoices\Signed";
             // ----------------------------------------------------------------
+
+            long sigBytes = File.Exists(SIG_FILE) ? new FileInfo(SIG_FILE).Length : -1;
+            this.SetTokenValue("DebugInfo",
+                "machine=" + Environment.MachineName +
+                "; user=" + Environment.UserName +
+                "; exeExists=" + File.Exists(EXE_PATH) +
+                "; sigBytes=" + sigBytes);
+
+            if (!File.Exists(EXE_PATH))
+                throw new Exception("stamper exe not found at " + EXE_PATH +
+                                    " on machine " + Environment.MachineName);
+            if (sigBytes <= 0)
+                throw new Exception("signature image missing or empty (" + sigBytes +
+                                    " bytes) at " + SIG_FILE);
 
             string workIn  = Path.Combine(WORK_ROOT, "in");
             string workOut = Path.Combine(WORK_ROOT, "out");
-            string exePath = EXE_PATH;
             Directory.CreateDirectory(workIn);
             Directory.CreateDirectory(workOut);
 
             Session session = this.RASession;
-            DocumentInfo doc = Document.GetDocumentInfo(this.BoundEntryId, session);
+            DocumentInfo doc = this.BoundEntryInfo as DocumentInfo;
+            if (doc == null)
+                throw new Exception("Starting entry is not a document");
 
-            string inPdf  = Path.Combine(workIn,  this.BoundEntryId + ".pdf");
-            string outPdf = Path.Combine(workOut, this.BoundEntryId + "_signed.pdf");
+            string inPdf  = Path.Combine(workIn,  doc.Id + ".pdf");
+            string outPdf = Path.Combine(workOut, doc.Id + "_signed.pdf");
 
             try
             {
                 // 1) Export the triggering invoice's electronic document
-                DocumentExporter dex = new DocumentExporter();
-                dex.ExportElecDoc(doc, inPdf);
-
-                // 2) Export the signature image from the repository (cached on disk;
-                //    re-exported only when the repository copy is newer). Phase 2
-                //    swaps this for a per-account signatures folder + --signatures.
-                DocumentInfo sigDoc = Document.GetDocumentInfo(SIG_LF_PATH, session);
-                string sigLocal = Path.Combine(WORK_ROOT, "signature." +
-                    (string.IsNullOrEmpty(sigDoc.Extension) ? "png" : sigDoc.Extension));
-                if (!File.Exists(sigLocal) ||
-                    File.GetLastWriteTimeUtc(sigLocal) < sigDoc.LastModifiedTime.ToUniversalTime())
+                string docMime;
+                using (Stream es = doc.ReadEdoc(out docMime))
+                using (FileStream fs = new FileStream(inPdf, FileMode.Create, FileAccess.Write))
                 {
-                    new DocumentExporter().ExportElecDoc(sigDoc, sigLocal);
+                    es.CopyTo(fs);
                 }
-                sigDoc.Dispose();
 
-                // 3) Run the stamper
-                ProcessStartInfo psi = new ProcessStartInfo
-                {
-                    FileName = exePath,
-                    Arguments = "\"" + inPdf + "\" --signature \"" + sigLocal +
-                                "\" --out-file \"" + outPdf + "\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
+                // 2) Run the stamper against the signature file on disk
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = EXE_PATH;
+                psi.Arguments = "\"" + inPdf + "\" --signature \"" + SIG_FILE +
+                                "\" --out-file \"" + outPdf + "\"";
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.CreateNoWindow = true;
+
                 int exitCode;
                 string stdout, stderr;
                 using (Process p = Process.Start(psi))
@@ -108,16 +122,20 @@ namespace WorkflowActivity.Scripting.SDKScript
                 this.SetTokenValue("StampStatus", status);
                 this.SetTokenValue("StampDetail", stdout + stderr);
 
-                // 4) On success, file the signed copy into \Invoices\Signed
+                // 3) On success, file the signed copy into the Signed folder
                 if (exitCode == 0)
                 {
                     FolderInfo signedFolder = Folder.GetFolderInfo(SIGNED_FOLDER, session);
                     DocumentInfo newDoc = new DocumentInfo(session);
                     newDoc.Create(signedFolder, doc.Name + " (signed)",
                                   doc.VolumeName, EntryNameOption.AutoRename);
-                    DocumentImporter dim = new DocumentImporter();
-                    dim.Document = newDoc;
-                    dim.ImportEdoc("application/pdf", outPdf);
+
+                    byte[] pdfBytes = File.ReadAllBytes(outPdf);
+                    using (Stream ws = newDoc.WriteEdoc("application/pdf", pdfBytes.Length))
+                    {
+                        ws.Write(pdfBytes, 0, pdfBytes.Length);
+                    }
+                    newDoc.Extension = "pdf";
                     newDoc.Save();
                     this.SetTokenValue("SignedEntryId", newDoc.Id.ToString());
                     newDoc.Dispose();
@@ -127,7 +145,6 @@ namespace WorkflowActivity.Scripting.SDKScript
             {
                 if (File.Exists(inPdf))  File.Delete(inPdf);
                 if (File.Exists(outPdf)) File.Delete(outPdf);
-                doc.Dispose();
             }
         }
     }

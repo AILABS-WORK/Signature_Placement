@@ -1,0 +1,13 @@
+﻿documents: 40 | stamped: 30 | failures: 0
+  note doc_005.pdf: correctly skipped (no empty space)
+  note doc_008.pdf: correctly skipped (no empty space)
+  note doc_010.pdf: correctly skipped (no empty space)
+  note doc_015.pdf: correctly skipped (no empty space)
+  note doc_016.pdf: page 3: found clean space despite crowding (ok)
+  note doc_020.pdf: correctly skipped (no empty space)
+  note doc_024.pdf: correctly skipped (no empty space)
+  note doc_025.pdf: correctly skipped (no empty space)
+  note doc_030.pdf: correctly skipped (no empty space)
+  note doc_032.pdf: correctly skipped (no empty space)
+  note doc_035.pdf: correctly skipped (no empty space)
+  note doc_040.pdf: page 3: found clean space despite crowding (ok)
