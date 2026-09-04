@@ -24,13 +24,14 @@ Exit codes: 0 = stamped, 2 = no banking details found, 3 = no empty space,
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
 
 import fitz  # PyMuPDF
 
-VERSION = "1.8.0"  # ignore invisible text/images too; richer --explain
+VERSION = "2.0.0"  # whitespace judged from the rendered page (pixels, not objects)
 
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
@@ -163,6 +164,70 @@ def occupied_rects(page: fitz.Page):
     return rects
 
 
+# Whitespace is decided from the rendered page, not the object list: what the
+# reader sees is the only reliable definition of "empty".
+RENDER_DPI = 100
+INK_TOL = 14          # how far a pixel must differ from the background to be ink
+
+
+class InkMap:
+    """Rasterised view of a page region with O(1) "is this rectangle empty?"
+    queries. The background tone is measured, so tinted stationery works and
+    invisible objects (white fills, hidden text, backdrops) simply never
+    appear."""
+
+    def __init__(self, page: fitz.Page, region: fitz.Rect):
+        zoom = RENDER_DPI / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=region,
+                              colorspace=fitz.csGRAY, alpha=False)
+        self.zoom = zoom
+        self.ox, self.oy = region.x0, region.y0
+        self.w, self.h = pix.width, pix.height
+        s = pix.samples
+
+        counts = {}
+        for v in s[::7]:                       # sampled: the background dominates
+            counts[v] = counts.get(v, 0) + 1
+        self.bg = max(counts.items(), key=lambda kv: kv[1])[0] if counts else 255
+
+        stride = self.w + 1
+        integ = [0] * (stride * (self.h + 1))
+        for j in range(self.h):
+            base, prev, cur = j * self.w, j * stride, (j + 1) * stride
+            acc = 0
+            for i in range(self.w):
+                if abs(s[base + i] - self.bg) > INK_TOL:
+                    acc += 1
+                integ[cur + i + 1] = integ[prev + i + 1] + acc
+        self.integ, self.stride = integ, stride
+
+    def ink(self, r: fitz.Rect) -> int:
+        """Ink pixels inside a PDF-space rect (clamped to the rendered region)."""
+        x0 = max(0, min(self.w, int((r.x0 - self.ox) * self.zoom)))
+        x1 = max(0, min(self.w, int(math.ceil((r.x1 - self.ox) * self.zoom))))
+        y0 = max(0, min(self.h, int((r.y0 - self.oy) * self.zoom)))
+        y1 = max(0, min(self.h, int(math.ceil((r.y1 - self.oy) * self.zoom))))
+        if x1 <= x0 or y1 <= y0:
+            return 0
+        I, st = self.integ, self.stride
+        return (I[y1 * st + x1] - I[y0 * st + x1]
+                - I[y1 * st + x0] + I[y0 * st + x0])
+
+    def is_clear(self, r: fitz.Rect, pad: float) -> bool:
+        return self.ink(r + (-pad, -pad, pad, pad)) == 0
+
+    def clearance(self, r: fitz.Rect, upto: float = 48) -> float:
+        """Largest padding (up to `upto`) that still finds no ink."""
+        best = 0.0
+        pad = 4.0
+        while pad <= upto:
+            if not self.is_clear(r, pad):
+                break
+            best = pad
+            pad += 4.0
+        return best
+
+
 # If a full-size signature has no room, retry at these scales before giving up.
 SIG_SCALES = [1.0, 0.85, 0.7]
 # Grid resolution for the placement search (pt).
@@ -176,7 +241,7 @@ VBUCKET = 8
 SCALE_PENALTY = 40
 
 
-def _place_at_size(page, block, occupied, page_right, w, h, min_clear):
+def _place_at_size(page, block, ink, page_right, w, h, min_clear):
     """Best placement of a w x h signature to the right of the block.
     Vertical centring on the block's band is the PRIMARY goal; at the chosen
     height the signature is centred within the run of usable white space.
@@ -193,31 +258,16 @@ def _place_at_size(page, block, occupied, page_right, w, h, min_clear):
         y_min = y_max = yc
     y_pref = band_y0 + (band_y1 - band_y0 - h) / 2  # perfectly centred on the band
 
-    rel = [r for r in occupied
-           if r.x1 > x_min - 80 and r.x0 < page_right + 80
-           and r.y1 > y_min - 80 and r.y0 < y_max + h + 80]
-
-    def clearance(cand):
-        c = min(cand.x0 - block.x1, page_right - cand.x1)
-        for r in rel:
-            if cand.intersects(r):
-                return -1.0
-            dx = max(r.x0 - cand.x1, cand.x0 - r.x1, 0.0)
-            dy = max(r.y0 - cand.y1, cand.y0 - r.y1, 0.0)
-            c = min(c, (dx * dx + dy * dy) ** 0.5)
-            if c < min_clear:
-                return c
-        return c
-
     best = None  # (sort key, rect, vertical offset, clearance, span)
     y = y_min
     while y <= y_max + 0.01:
         # usable left-edge positions at this height, grouped into runs
         runs, cur, x = [], [], x_min
         while x <= x_max + 0.01:
-            c = clearance(fitz.Rect(x, y, x + w, y + h))
-            if c >= min_clear:
-                cur.append((x, c))
+            cand = fitz.Rect(x, y, x + w, y + h)
+            edge = min(cand.x0 - block.x1, page_right - cand.x1)
+            if edge >= min_clear and ink.is_clear(cand, min_clear):
+                cur.append((x, min(edge, ink.clearance(cand))))
             elif cur:
                 runs.append(cur)
                 cur = []
@@ -243,16 +293,21 @@ def find_empty_spot(page: fitz.Page, block: fitz.Rect):
 
     Vertically it is centred on the block's band (never above or below it);
     horizontally it is centred in the white space available at that height.
-    Sizes are tried largest-first and a smaller signature wins only when it buys
-    materially better vertical centring (see SCALE_PENALTY). A first pass demands
-    comfortable clearance on all sides; a second accepts tighter spots."""
-    occupied = occupied_rects(page)
+    Emptiness is judged from the RENDERED page, so only things a reader can
+    actually see block the signature. Sizes are tried largest-first and a
+    smaller signature wins only when it buys materially better vertical centring
+    (see SCALE_PENALTY). A first pass demands comfortable clearance on all
+    sides; a second accepts tighter spots."""
     page_right = page.rect.width - PAD
+    region = fitz.Rect(max(0, block.x1 - 80), max(0, block.y0 - 30),
+                       min(page.rect.width, page_right + 4),
+                       min(page.rect.height, block.y1 + 30))
+    ink = InkMap(page, region)
 
     for min_clear, label in ((GOOD_CLEARANCE, "centered"), (PAD, "centered (tight)")):
         options = []
         for scale in SIG_SCALES:
-            got = _place_at_size(page, block, occupied, page_right,
+            got = _place_at_size(page, block, ink, page_right,
                                  SIG_WIDTH * scale, SIG_HEIGHT * scale, min_clear)
             if got is not None:
                 rect, voff, clear, span = got
@@ -275,6 +330,26 @@ def explain_page(page: fitz.Page, block: fitz.Rect):
     print(f"  EXPLAIN page {page.number + 1}: page={page.rect.width:.0f}x"
           f"{page.rect.height:.0f}, block=[{block.x0:.0f},{block.y0:.0f},"
           f"{block.x1:.0f},{block.y1:.0f}]")
+
+    # authoritative view: where is there VISIBLE ink in the band?
+    page_right = page.rect.width - PAD
+    region = fitz.Rect(max(0, block.x1 - 80), max(0, block.y0 - 30),
+                       min(page.rect.width, page_right + 4),
+                       min(page.rect.height, block.y1 + 30))
+    ink = InkMap(page, region)
+    print(f"    rendered band bg tone={ink.bg}; ink columns (visible content):")
+    runs, start, x = [], None, block.x1
+    while x < page_right:
+        has = ink.ink(fitz.Rect(x, block.y0, x + 4, block.y1)) > 0
+        if has and start is None:
+            start = x
+        elif not has and start is not None:
+            runs.append((start, x))
+            start = None
+        x += 4
+    if start is not None:
+        runs.append((start, page_right))
+    print("      " + (", ".join(f"[{a:.0f},{b:.0f}]" for a, b in runs) or "none — all clear"))
 
     def in_band(r):
         return r.y1 > block.y0 - 2 and r.y0 < block.y1 + 2 and r.x1 > block.x1
