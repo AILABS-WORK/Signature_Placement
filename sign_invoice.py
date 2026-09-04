@@ -31,7 +31,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
-VERSION = "2.0.0"  # whitespace judged from the rendered page (pixels, not objects)
+VERSION = "2.1.0"  # aim for the centre of the open region; report visible ink
 
 # Headings that mark the banking-details block. Only accepted when the line is
 # essentially just this text (so a sentence merely mentioning "banking details"
@@ -181,9 +181,11 @@ class InkMap:
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=region,
                               colorspace=fitz.csGRAY, alpha=False)
         self.zoom = zoom
-        self.ox, self.oy = region.x0, region.y0
+        # the pixmap's own origin, not the requested clip: they differ by the
+        # rounding to whole device pixels
+        self.ox, self.oy = pix.x / zoom, pix.y / zoom
         self.w, self.h = pix.width, pix.height
-        s = pix.samples
+        s, row_bytes = pix.samples, pix.stride   # stride may exceed width
 
         counts = {}
         for v in s[::7]:                       # sampled: the background dominates
@@ -193,13 +195,28 @@ class InkMap:
         stride = self.w + 1
         integ = [0] * (stride * (self.h + 1))
         for j in range(self.h):
-            base, prev, cur = j * self.w, j * stride, (j + 1) * stride
+            base, prev, cur = j * row_bytes, j * stride, (j + 1) * stride
             acc = 0
             for i in range(self.w):
                 if abs(s[base + i] - self.bg) > INK_TOL:
                     acc += 1
                 integ[cur + i + 1] = integ[prev + i + 1] + acc
         self.integ, self.stride = integ, stride
+
+    def ink_columns(self, y0: float, y1: float, x0: float, x1: float, step: float = 4):
+        """x-ranges between x0 and x1 that contain visible ink between y0 and y1."""
+        runs, start, x = [], None, x0
+        while x < x1:
+            if self.ink(fitz.Rect(x, y0, x + step, y1)) > 0:
+                if start is None:
+                    start = x
+            elif start is not None:
+                runs.append((start, x))
+                start = None
+            x += step
+        if start is not None:
+            runs.append((start, x1))
+        return runs
 
     def ink(self, r: fitz.Rect) -> int:
         """Ink pixels inside a PDF-space rect (clamped to the rendered region)."""
@@ -241,7 +258,7 @@ VBUCKET = 8
 SCALE_PENALTY = 40
 
 
-def _place_at_size(page, block, ink, page_right, w, h, min_clear):
+def _place_at_size(page, block, ink, page_right, w, h, min_clear, open_x0=None):
     """Best placement of a w x h signature to the right of the block.
     Vertical centring on the block's band is the PRIMARY goal; at the chosen
     height the signature is centred within the run of usable white space.
@@ -258,30 +275,32 @@ def _place_at_size(page, block, ink, page_right, w, h, min_clear):
         y_min = y_max = yc
     y_pref = band_y0 + (band_y1 - band_y0 - h) / 2  # perfectly centred on the band
 
+    # the ideal spot: dead centre of the open region, which starts at the last
+    # visible ink in the band (the block rect can under-measure the values)
+    left = block.x1 if open_x0 is None else open_x0
+    x_ideal = left + (page_right - left - w) / 2
+
     best = None  # (sort key, rect, vertical offset, clearance, span)
     y = y_min
     while y <= y_max + 0.01:
-        # usable left-edge positions at this height, grouped into runs
-        runs, cur, x = [], [], x_min
+        # every usable position at this height, and the one nearest the ideal
+        usable, x = [], x_min
         while x <= x_max + 0.01:
             cand = fitz.Rect(x, y, x + w, y + h)
             edge = min(cand.x0 - block.x1, page_right - cand.x1)
             if edge >= min_clear and ink.is_clear(cand, min_clear):
-                cur.append((x, min(edge, ink.clearance(cand))))
-            elif cur:
-                runs.append(cur)
-                cur = []
+                usable.append(x)
             x += GRID
-        if cur:
-            runs.append(cur)
-        if runs:
-            run = max(runs, key=len)          # widest white space at this height
-            x_at, c_at = run[len(run) // 2]   # centred within it
+        if usable:
+            x_at = min(usable, key=lambda xx: abs(xx - x_ideal))
+            rect = fitz.Rect(x_at, y, x_at + w, y + h)
             voff = abs(y - y_pref)
-            key = (round(voff / VBUCKET), -len(run))
+            # vertical centring first, then closeness to the ideal horizontal spot
+            key = (round(voff / VBUCKET), abs(x_at - x_ideal))
             if best is None or key < best[0]:
-                span = (run[0][0], run[-1][0] + w)
-                best = (key, fitz.Rect(x_at, y, x_at + w, y + h), voff, c_at, span)
+                clear = min(min(rect.x0 - block.x1, page_right - rect.x1),
+                            ink.clearance(rect))
+                best = (key, rect, voff, clear, (usable[0], usable[-1] + w))
         y += GRID
     if best is None:
         return None
@@ -304,22 +323,36 @@ def find_empty_spot(page: fitz.Page, block: fitz.Rect):
                        min(page.rect.height, block.y1 + 30))
     ink = InkMap(page, region)
 
+    # where the open white space really begins: past the last visible ink that
+    # belongs to the banking block itself (values often outrun the text rect)
+    cols = ink.ink_columns(block.y0, block.y1, block.x1, page_right)
+    open_x0 = block.x1
+    for a, b in cols:
+        if a <= open_x0 + COLUMN_GAP_MAX:
+            open_x0 = max(open_x0, b)
+        else:
+            break
+
     for min_clear, label in ((GOOD_CLEARANCE, "centered"), (PAD, "centered (tight)")):
         options = []
         for scale in SIG_SCALES:
             got = _place_at_size(page, block, ink, page_right,
-                                 SIG_WIDTH * scale, SIG_HEIGHT * scale, min_clear)
+                                 SIG_WIDTH * scale, SIG_HEIGHT * scale, min_clear,
+                                 open_x0)
             if got is not None:
                 rect, voff, clear, span = got
                 options.append((voff + SCALE_PENALTY * (1 - scale), scale,
                                 rect, voff, clear, span))
         if options:
             _, scale, rect, voff, clear, span = min(options, key=lambda o: o[0])
+            shown = ", ".join(f"[{a:.0f},{b:.0f}]" for a, b in cols[:6]) or "none"
             print(f"  placement: {label}, v-offset={voff:.0f}pt, "
                   f"clearance={clear:.0f}pt, scale={scale:g}, "
                   f"band y=[{block.y0:.0f},{block.y1:.0f}], "
                   f"block x1={block.x1:.0f}, hspace=[{span[0]:.0f},{span[1]:.0f}], "
                   f"page w={page.rect.width:.0f}, at x={rect.x0:.0f}")
+            print(f"  visible ink right of block: {shown}; "
+                  f"open space starts x={open_x0:.0f}, ends x={page_right:.0f}")
             return rect
     return None
 
