@@ -14,7 +14,10 @@
 //                                        import signed pdf into SIGNED_FOLDER
 //                                        delete temp files
 // Tokens: StampStatus (stamped | no_banking_details | no_empty_space |
-//         no_matching_signature | error), StampDetail, SignedEntryId, DebugInfo.
+//         no_matching_signature | not_a_pdf | not_electronic_pdf |
+//         not_a_document | error), StampDetail, SignedEntryId, DebugInfo.
+// Only "stamped" is success; route every other value to Needs_Review and show
+// StampDetail, which always says what to do about it.
 //
 // No extra assembly references: RepositoryAccess only (no DocumentServices, so
 // no version-mismatch warnings). ReadEdoc/WriteEdoc use this RA version's
@@ -75,7 +78,11 @@ namespace WorkflowActivity.Scripting.SDKScript
             Session session = this.RASession;
             DocumentInfo doc = this.BoundEntryInfo as DocumentInfo;
             if (doc == null)
-                throw new Exception("Starting entry is not a document");
+            {
+                this.SetTokenValue("StampStatus", "not_a_document");
+                this.SetTokenValue("StampDetail", "The entry is a folder or shortcut, not a document.");
+                return;
+            }
 
             string inPdf  = Path.Combine(workIn,  doc.Id + ".pdf");
             string outPdf = Path.Combine(workOut, doc.Id + "_signed.pdf");
@@ -88,6 +95,25 @@ namespace WorkflowActivity.Scripting.SDKScript
                 using (FileStream fs = new FileStream(inPdf, FileMode.Create, FileAccess.Write))
                 {
                     es.CopyTo(fs);
+                }
+
+                // Anyone can drop anything into a shared folder, so check what
+                // actually arrived before handing it to the stamper.
+                if (!"pdf".Equals(doc.Extension, StringComparison.OrdinalIgnoreCase))
+                {
+                    this.SetTokenValue("StampStatus", "not_a_pdf");
+                    this.SetTokenValue("StampDetail",
+                        "Extension is '" + doc.Extension + "'. Only PDFs can be stamped.");
+                    return;
+                }
+                if (new FileInfo(inPdf).Length == 0)
+                {
+                    this.SetTokenValue("StampStatus", "not_electronic_pdf");
+                    this.SetTokenValue("StampDetail",
+                        "This entry has no electronic file — it was imported as Laserfiche " +
+                        "image pages. Re-import the PDF as an electronic document (do not " +
+                        "let the client generate pages).");
+                    return;
                 }
 
                 // 2) Run the stamper against the signature file on disk
